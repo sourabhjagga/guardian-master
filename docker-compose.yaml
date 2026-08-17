@@ -1,7 +1,7 @@
 version: "3.8"
 services:
   guardian:
-    image: ${DOCKERHUB_USERNAME:-guardian}/guardian-master:latest
+    image: sourabhjagga/guardian-master:latest
     environment:
       - GUARDIAN_COOLIFY_API
       - GUARDIAN_COOLIFY_TOKEN
