@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  guardian:
+    image: ${DOCKERHUB_USERNAME:-guardian}/guardian-master:latest
+    environment:
+      - GUARDIAN_COOLIFY_API
+      - GUARDIAN_COOLIFY_TOKEN
+      - GUARDIAN_GITHUB_TOKEN
+      - GUARDIAN_DB=/data/guardian.db
+      - PORT=8000
+    volumes:
+      - guardian_data:/data
+    ports:
+      - "8000:8000"
+volumes:
+  guardian_data:
