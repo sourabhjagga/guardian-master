@@ -33,9 +33,10 @@ CREATE TABLE IF NOT EXISTS apps (
     id              TEXT PRIMARY KEY,      -- Coolify application UUID
     name            TEXT UNIQUE,
     repo_url        TEXT,
-    sla_days        INTEGER DEFAULT 90,
-    first_seen_at   TEXT DEFAULT (datetime('now')),
-    last_synced_at  TEXT
+     sla_days        INTEGER DEFAULT 90,
+     port            INTEGER,             -- exposed port (for conflict detection)
+     first_seen_at   TEXT DEFAULT (datetime('now')),
+     last_synced_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS env_vars (
@@ -200,31 +201,37 @@ def sync_dependencies(app_id, lockfile_deps, repo_url):
 # --------------------------------------------------------------------------- #
 @app.route("/")
 def dashboard():
-    db = get_db()
-    apps = db.execute(
-        "SELECT id, name, sla_days, last_synced_at FROM apps ORDER BY name").fetchall()
-    enriched = []
-    for a in apps:
-        rots = db.execute(
-            "SELECT COUNT(*) c FROM rotations WHERE app_id=?", (a["id"],)).fetchone()["c"]
-        last_rot = db.execute(
-            "SELECT rotated_at FROM rotations WHERE app_id=? ORDER BY rotated_at DESC LIMIT 1",
-            (a["id"],)).fetchone()
-        last = last_rot["rotated_at"] if last_rot else None
-        late = None
-        on_time = True
-        if last and a["last_synced_at"]:
-            import datetime as _dt
-            last_d = _dt.date.fromisoformat(last[:10])
-            now_d = _dt.date.fromisoformat(a["last_synced_at"][:10])
-            days = (now_d - last_d).days
-            late = days if days > a["sla_days"] else None
-            on_time = late is None
-        enriched.append({
-            "id": a["id"], "name": a["name"], "sla": a["sla_days"],
-            "rots": rots, "late": late, "on_time": on_time,
-        })
-    return render_template_string(DASHBOARD_TMPL, apps=enriched)
+     db = get_db()
+     apps = db.execute(
+         "SELECT id, name, sla_days, port, last_synced_at FROM apps ORDER BY name").fetchall()
+     # collect ports for conflict detection
+     all_ports = db.execute("SELECT port FROM apps WHERE port IS NOT NULL").fetchall()
+     used_ports = {r["port"] for r in all_ports}
+     enriched = []
+     for a in apps:
+         rots = db.execute(
+             "SELECT COUNT(*) c FROM rotations WHERE app_id=?", (a["id"],)).fetchone()["c"]
+         last_rot = db.execute(
+             "SELECT rotated_at FROM rotations WHERE app_id=? ORDER BY rotated_at DESC LIMIT 1",
+             (a["id"],)).fetchone()
+         last = last_rot["rotated_at"] if last_rot else None
+         late = None
+         on_time = True
+         if last and a["last_synced_at"]:
+             import datetime as _dt
+             last_d = _dt.date.fromisoformat(last[:10])
+             now_d = _dt.date.fromisoformat(a["last_synced_at"][:10])
+             days = (now_d - last_d).days
+             late = days if days > a["sla_days"] else None
+             on_time = late is None
+         # conflict flag (not used yet - informational)
+         conflict = None
+         enriched.append({
+             "id": a["id"], "name": a["name"], "sla": a["sla_days"],
+             "port": a["port"], "conflict": conflict,
+             "rots": rots, "late": late, "on_time": on_time,
+         })
+     return render_template_string(DASHBOARD_TMPL, apps=enriched, used_ports=used_ports)
 
 
 @app.route("/sync")
@@ -238,15 +245,20 @@ def sync_handler():
     db = get_db()
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
     for app in apps:
-        app_id = app["uuid"]           # Coolify app UUID
+        app_id = app["uuid"]           # Coolify application UUID
         name = app["name"]
         slug = _slug(name)
         repo_url = app.get("source", {}).get("repo", "") or app.get("env", {}).get("GIT_REPOSITORY")
         sla = _slug_to_sla(slug)
+        # extract port: Coolify publishedPort or env PORT
+        port = app.get("publishedPort") or (app.get("ports", [{}])[0].get("published") if app.get("ports") else None)
+        if not port:
+            env = app.get("env", {})
+            port = int(env.get("PORT")) if env.get("PORT", "").isdigit() else None
         db.execute(
-            "INSERT OR REPLACE INTO apps(id,name,repo_url,sla_days,last_synced_at) "
-            "VALUES(?,?,?,?,?)",
-            (app_id, name, repo_url, sla, now))
+            "INSERT OR REPLACE INTO apps(id,name,repo_url,sla_days,port,last_synced_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (app_id, name, repo_url, sla, port, now))
         # 1. env vars (rotation poll-hash)
         env_r = cs.get(f"{COOLIFY_API}/applications/{app_id}/env")
         env_rows = env_r.json() if env_r.status_code == 200 else []
@@ -293,10 +305,11 @@ DASHBOARD_TMPL = """
 <link href="https://cdn.jsdelivr.net/npm/tailwindcss@3.4.0/dist/tailwind.min.css" rel="stylesheet">
 </head><body class="p-4">
 <h1 class="text-xl font-bold mb-4">Guardian Dashboard</h1>
-<table class="w-full text-sm"><thead><tr><th class="text-left">App</th><th>SLA(d)</th><th>Rotations</th><th>Late(d)</th></tr></thead><tbody>
+{% if used_ports %}<p class="text-sm text-gray-600 mb-2">Occupied ports: {{ used_ports|sort|join(', ') }}</p>{% endif %}
+<table class="w-full text-sm"><thead><tr><th class="text-left">App</th><th>Port</th><th>SLA(d)</th><th>Rotations</th><th>Late(d)</th></tr></thead><tbody>
 {% for a in apps %}
 <tr class="{{ 'bg-red-100' if a['late'] else 'bg-green-50' if a['on_time'] else ''}}">
-<td><a href="/app/{{a['id']}}">{{a['name']}}</a></td><td>{{a['sla']}}</td><td>{{a['rots']}}</td><td>{{a['late']}}</td></tr>
+<td><a href="/app/{{a['id']}}">{{a['name']}}</a></td><td>{{a['port'] or '—'}}</td><td>{{a['sla']}}</td><td>{{a['rots']}}</td><td>{{a['late'] or ''}}</td></tr>
 {% endfor %}
 </tbody></table>
 {% if not apps %}<p>No apps synced. Run <code>/sync</code>.</p>{% endif %}
@@ -321,7 +334,7 @@ APP_TMPL = """
 def api_apps():
     db = get_db()
     rows = db.execute(
-        "SELECT id, name, repo_url, sla_days, last_synced_at FROM apps ORDER BY name").fetchall()
+        "SELECT id, name, repo_url, sla_days, port, last_synced_at FROM apps ORDER BY name").fetchall()
     return jsonify([dict(r) for r in rows])
 
 
